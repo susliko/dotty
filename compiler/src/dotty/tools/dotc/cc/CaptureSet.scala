@@ -117,6 +117,17 @@ sealed abstract class CaptureSet extends Showable:
       || !x.isRootCapability && x.captureSetOfInfo.subCaptures(this, frozen = true).isOK
     }
 
+  /** A more optimistic version of accountsFor, which does not take variable supersets
+   *  of the `x` reference into account. A set might account for `x` if it accounts
+   *  for `x` in a state where we assume all supersets of `x` have just the elements
+   *  known at this point.
+   */
+  def mightAccountFor(x: CaptureRef)(using ctx: Context): Boolean =
+    reporting.trace(i"$this mightAccountFor $x, ${x.captureSetOfInfo}?", show = true) {
+      elems.exists(_.subsumes(x))
+      || !x.isRootCapability && x.captureSetOfInfo.elems.forall(mightAccountFor)
+    }
+
   /** The subcapturing test */
   final def subCaptures(that: CaptureSet, frozen: Boolean)(using Context): CompareResult =
     subCaptures(that)(using ctx, if frozen then FrozenState else VarState())
@@ -160,9 +171,8 @@ sealed abstract class CaptureSet extends Showable:
   def **(that: CaptureSet)(using Context): CaptureSet =
     if this.subCaptures(that, frozen = true).isOK then this
     else if that.subCaptures(this, frozen = true).isOK then that
-    else if this.isConst && that.isConst then Const(elems.intersect(that.elems))
-    else if that.isConst then Intersected(this.asVar, that)
-    else Intersected(that.asVar, this)
+    else if this.isConst && that.isConst then Const(elemIntersection(this, that))
+    else Intersected(this, that)
 
   def -- (that: CaptureSet.Const)(using Context): CaptureSet =
     val elems1 = elems.filter(!that.accountsFor(_))
@@ -247,9 +257,8 @@ sealed abstract class CaptureSet extends Showable:
     ((NoType: Type) /: elems) ((tp, ref) =>
       if tp.exists then OrType(tp, ref, soft = false) else ref)
 
-  def toRegularAnnotation(byName: Boolean)(using Context): Annotation =
-    val kind = if byName then CapturingKind.ByName else CapturingKind.Regular
-    Annotation(CaptureAnnotation(this, kind).tree)
+  def toRegularAnnotation(cls: Symbol)(using Context): Annotation =
+    Annotation(CaptureAnnotation(this, boxed = false)(cls).tree)
 
   override def toText(printer: Printer): Text =
     Str("{") ~ Text(elems.toList.map(printer.toTextCaptureRef), ", ") ~ Str("}") ~~ description
@@ -516,10 +525,29 @@ object CaptureSet:
   class Diff(source: Var, other: Const)(using Context)
   extends Filtered(source, !other.accountsFor(_))
 
-  /** A variable with elements given at any time as { x <- source.elems | other.accountsFor(x) } */
-  class Intersected(source: Var, other: CaptureSet)(using Context)
-  extends Filtered(source, other.accountsFor(_)):
-    addSub(other)
+  def elemIntersection(cs1: CaptureSet, cs2: CaptureSet)(using Context): Refs =
+    cs1.elems.filter(cs2.mightAccountFor) ++ cs2.elems.filter(cs1.mightAccountFor)
+
+  class Intersected(cs1: CaptureSet, cs2: CaptureSet)(using Context)
+  extends Var(elemIntersection(cs1, cs2)):
+    addSub(cs1)
+    addSub(cs2)
+    deps += cs1
+    deps += cs2
+
+    override def addNewElems(newElems: Refs, origin: CaptureSet)(using Context, VarState): CompareResult =
+      super.addNewElems(
+        if origin eq cs1 then newElems.filter(cs2.accountsFor)
+        else if origin eq cs2 then newElems.filter(cs1.accountsFor)
+        else newElems, origin)
+
+    override def computeApprox(origin: CaptureSet)(using Context): CaptureSet =
+      if (origin eq cs1) || (origin eq cs2) then universal
+      else CaptureSet(elemIntersection(cs1.upperApprox(this), cs2.upperApprox(this)))
+
+    override def propagateSolved()(using Context) =
+      if cs1.isConst && cs2.isConst && !isConst then markSolved()
+  end Intersected
 
   def extrapolateCaptureRef(r: CaptureRef, tm: TypeMap, variance: Int)(using Context): CaptureSet =
     val r1 = tm(r)
@@ -537,7 +565,7 @@ object CaptureSet:
     mapRefs(xs, extrapolateCaptureRef(_, tm, variance))
 
   def subCapturesRange(arg1: TypeBounds, arg2: Type)(using Context): Boolean = arg1 match
-    case TypeBounds(CapturingType(lo, loRefs, _), CapturingType(hi, hiRefs, _)) if lo =:= hi =>
+    case TypeBounds(CapturingType(lo, loRefs), CapturingType(hi, hiRefs)) if lo =:= hi =>
       given VarState = VarState()
       val cs2 = arg2.captureSet
       hiRefs.subCaptures(cs2).isOK && cs2.subCaptures(loRefs).isOK
@@ -633,7 +661,7 @@ object CaptureSet:
         if tp.classSymbol.hasAnnotation(defn.CapabilityAnnot) then universal else empty
       case _: TypeParamRef =>
         empty
-      case CapturingType(parent, refs, _) =>
+      case CapturingType(parent, refs) =>
         recur(parent) ++ refs
       case AppliedType(tycon, args) =>
         val cs = recur(tycon)

@@ -30,9 +30,12 @@ object CheckCaptures:
      *  in Setup if they have non-empty capture sets
      */
     def transformSym(sym: SymDenotation)(using Context): SymDenotation =
-      if sym.isAllOf(PrivateParamAccessor) && !sym.hasAnnotation(defn.ConstructorOnlyAnnot)
-      then sym.copySymDenotation(initFlags = sym.flags &~ Private | Recheck.ResetPrivate)
-      else sym
+      if sym.isAllOf(PrivateParamAccessor) && !sym.hasAnnotation(defn.ConstructorOnlyAnnot) then
+        sym.copySymDenotation(initFlags = sym.flags &~ Private | Recheck.ResetPrivate)
+      else if Synthetics.needsTransform(sym) then
+        Synthetics.transformToCC(sym)
+      else
+        sym
   end Pre
 
   case class Env(owner: Symbol, captured: CaptureSet, isBoxed: Boolean, outer0: Env | Null):
@@ -69,7 +72,7 @@ object CheckCaptures:
    *  This check is performed after capture sets are computed in phase cc.
    */
   def checkWellformedPost(tp: Type, pos: SrcPos)(using Context): Unit = tp match
-    case CapturingType(parent, refs, _) =>
+    case CapturingType(parent, refs) =>
       for ref <- refs.elems do
         if ref.captureSetOfInfo.elems.isEmpty then
           report.error(em"$ref cannot be tracked since its capture set is empty", pos)
@@ -106,6 +109,10 @@ class CheckCaptures extends Recheck, SymTransformer:
     checkOverrides.traverse(ctx.compilationUnit.tpdTree)
     super.run
 
+  override def transformSym(sym: SymDenotation)(using Context): SymDenotation =
+    if Synthetics.needsTransform(sym) then Synthetics.transformFromCC(sym)
+    else super.transformSym(sym)
+
   def checkOverrides = new TreeTraverser:
     def traverse(t: Tree)(using Context) =
       t match
@@ -124,7 +131,7 @@ class CheckCaptures extends Recheck, SymTransformer:
       variance = startingVariance
       override def traverse(t: Type) =
         t match
-          case CapturingType(parent, refs: CaptureSet.Var, _) =>
+          case CapturingType(parent, refs: CaptureSet.Var) =>
             if variance < 0 then
               capt.println(i"solving $t")
               refs.solve()
@@ -186,6 +193,34 @@ class CheckCaptures extends Recheck, SymTransformer:
           case _ => true
         }
         checkSubset(targetSet, curEnv.captured, pos)
+
+    /** If result type of a function type has toplevel boxed captures, propagate
+     *  them to the function type as a whole. Such boxed captures
+     *  can be created by substitution or as-seen-from. Propagating captures to the
+     *  left simulates an unbox operation on the result. I.e. if f has type `A -> box C B`
+     *  then in theory we need to unbox with
+     *
+     *      x => C o- f(x)
+     *
+     *   and that also propagates C into the type of the unboxing expression.
+     *   TODO: Generalize this to boxed captues in other parts of a function type.
+     */
+    def addResultBoxes(tp: Type)(using Context): Type =
+      def includeBoxed(res: Type) = tp.capturing(res.boxedCaptured)
+      val tpw = tp.widen
+      val boxedTpw = tpw.dealias match
+        case tp1 @ AppliedType(_, args) if defn.isNonRefinedFunction(tp1) =>
+          includeBoxed(args.last)
+        case tp1 @ RefinedType(_, _, rinfo) if defn.isFunctionType(tp1) =>
+          includeBoxed(rinfo.finalResultType)
+        case tp1 @ CapturingType(parent, refs) =>
+          val boxedParent = addResultBoxes(parent)
+          if boxedParent eq parent then tpw
+          else boxedParent.capturing(refs)
+        case _ =>
+          tpw
+      if boxedTpw eq tpw then tp else boxedTpw
+    end addResultBoxes
 
     def assertSub(cs1: CaptureSet, cs2: CaptureSet)(using Context) =
       assert(cs1.subCaptures(cs2, frozen = false).isOK, i"$cs1 is not a subset of $cs2")
@@ -261,14 +296,7 @@ class CheckCaptures extends Recheck, SymTransformer:
           interpolateVarsIn(tree.tpt)
 
     override def recheckDefDef(tree: DefDef, sym: Symbol)(using Context): Unit =
-      val isExcluded =
-        sym.is(Synthetic)
-        && sym.owner.isClass
-        && ( defn.caseClassSynthesized.exists(
-                ccsym => sym.overriddenSymbol(ccsym.owner.asClass) == ccsym)
-            || sym.name == nme.fromProduct
-        )
-      if !isExcluded then
+      if !Synthetics.isExcluded(sym) then
         val saved = curEnv
         val localSet = capturedVars(sym)
         if !localSet.isAlwaysEmpty then curEnv = Env(sym, localSet, false, curEnv)
@@ -327,7 +355,7 @@ class CheckCaptures extends Recheck, SymTransformer:
         def augmentConstructorType(core: Type, initCs: CaptureSet): Type = core match
           case core: MethodType =>
             core.derivedLambdaType(resType = augmentConstructorType(core.resType, initCs))
-          case CapturingType(parent, refs, _) =>
+          case CapturingType(parent, refs) =>
             augmentConstructorType(parent, initCs ++ refs)
           case _ =>
             val (refined, cs) = addParamArgRefinements(core, initCs)
@@ -369,7 +397,7 @@ class CheckCaptures extends Recheck, SymTransformer:
     override def recheckApply(tree: Apply, pt: Type)(using Context): Type =
       includeCallCaptures(tree.symbol, tree.srcPos)
       super.recheckApply(tree, pt) match
-        case tp @ CapturingType(tp1, refs, kind) =>
+        case tp @ CapturingType(tp1, refs) =>
           tree.fun match
             case Select(qual, nme.apply)
             if defn.isFunctionType(qual.tpe.widen) =>
@@ -409,7 +437,7 @@ class CheckCaptures extends Recheck, SymTransformer:
         case _ =>
           NoType
       def checkNotUniversal(tp: Type): Unit = tp.widenDealias match
-        case wtp @ CapturingType(parent, refs, _) =>
+        case wtp @ CapturingType(parent, refs) =>
           refs.disallowRootCapability { () =>
             val kind = if tree.isInstanceOf[ValDef] then "mutable variable" else "expression"
             report.error(
@@ -420,7 +448,8 @@ class CheckCaptures extends Recheck, SymTransformer:
           checkNotUniversal(parent)
         case _ =>
       checkNotUniversal(typeToCheck)
-      super.recheckFinish(tpe, tree, pt)
+      val tpe1 = if tree.isTerm then addResultBoxes(tpe) else tpe
+      super.recheckFinish(tpe1, tree, pt)
 
     /** This method implements the rule outlined in #14390:
      *  When checking an expression `e: T` against an expected type `Cx Tx`
@@ -453,7 +482,7 @@ class CheckCaptures extends Recheck, SymTransformer:
               erefs
         }
       val expected1 = expected match
-        case CapturingType(ecore, erefs, _) =>
+        case CapturingType(ecore, erefs) =>
           val erefs1 = augment(erefs, actual.captureSet)
           if erefs1 ne erefs then
             capt.println(i"augmented $expected from ${actual.captureSet} --> $erefs1")
@@ -508,7 +537,7 @@ class CheckCaptures extends Recheck, SymTransformer:
           interpolator(startingVariance = -1).traverse(selfType)
           if !root.isEffectivelySealed  then
             selfType match
-              case CapturingType(_, refs: CaptureSet.Var, _) if !refs.isUniversal =>
+              case CapturingType(_, refs: CaptureSet.Var) if !refs.isUniversal =>
                 report.error(
                   i"""$root needs an explicitly declared self type since its
                      |inferred self type $selfType
@@ -536,8 +565,8 @@ class CheckCaptures extends Recheck, SymTransformer:
               checkWellformedPost(annot.tree)
             case _ =>
           }
-        case t: ValOrDefDef if t.tpt.isInstanceOf[InferredTypeTree]
-            && !t.symbol.is(Synthetic) =>  // !!! needs to be refined
+        case t: ValOrDefDef
+        if t.tpt.isInstanceOf[InferredTypeTree] && !Synthetics.isExcluded(t.symbol) =>
           val sym = t.symbol
           val isLocal =
             sym.owner.ownersIterator.exists(_.isTerm)
@@ -550,7 +579,7 @@ class CheckCaptures extends Recheck, SymTransformer:
           then
             val inferred = t.tpt.knownType
             def checkPure(tp: Type) = tp match
-              case CapturingType(_, refs, _) if !refs.elems.isEmpty =>
+              case CapturingType(_, refs) if !refs.elems.isEmpty =>
                 val resultStr = if t.isInstanceOf[DefDef] then " result" else ""
                 report.error(
                   em"""Non-local $sym cannot have an inferred$resultStr type
