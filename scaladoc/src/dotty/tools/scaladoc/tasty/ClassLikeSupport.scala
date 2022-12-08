@@ -263,14 +263,19 @@ trait ClassLikeSupport:
       }
 
     def getParentsAsTreeSymbolTuples: List[(Tree, Symbol)] =
+      println(c)
       if noPosClassDefs.contains(c.symbol) then Nil
       else for
-        parentTree <- c.parents if parentTree.pos.start != parentTree.pos.end // We assume here that order is correct
+        parentTree <- c.parents 
+        _ = println(parentTree)
+        _ = println(parentTree.pos.start)
+        _ = println(parentTree.pos.sourceCode)
         parentSymbol = parentTree match
           case t: TypeTree => t.tpe.typeSymbol
           case tree if tree.symbol.isClassConstructor => tree.symbol.owner
           case tree => tree.symbol
         if parentSymbol != defn.ObjectClass && parentSymbol != defn.AnyClass && !parentSymbol.isHiddenByVisibility
+        if parentTree.pos.start != parentTree.pos.end // We assume here that order is correct
       yield (parentTree, parentSymbol)
 
     def getConstructors: List[Symbol] = c.membersToDocument.collect {
